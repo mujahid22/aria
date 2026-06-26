@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,10 +37,21 @@ class RequirementRequest(BaseModel):
     requirement: str
 
 
-async def _split_with_fallback(raw_requirement: str) -> list[str]:
+def _trace_config(submission_id: str, source: str, **metadata: object) -> dict:
+    """Tags every LLM/tool call under one submission with a shared id, so a
+    LangSmith trace search for submission_id finds the split call plus every
+    per-requirement pipeline run it produced, instead of dozens of unrelated
+    root runs."""
+    return {
+        "tags": [source],
+        "metadata": {"submission_id": submission_id, **metadata},
+    }
+
+
+async def _split_with_fallback(raw_requirement: str, *, config: dict | None = None) -> list[str]:
     try:
         return await asyncio.wait_for(
-            split_requirements(raw_requirement), timeout=SPLIT_TIMEOUT_SECONDS
+            split_requirements(raw_requirement, config=config), timeout=SPLIT_TIMEOUT_SECONDS
         )
     except Exception:
         return [raw_requirement]
@@ -48,8 +60,19 @@ async def _split_with_fallback(raw_requirement: str) -> list[str]:
 @app.post("/api/requirements")
 async def submit_requirement(body: RequirementRequest) -> dict:
     """Non-streaming run - useful for smoke-testing the graph directly."""
-    snippets = await _split_with_fallback(body.requirement)
-    final_states = [await aria_graph.ainvoke(initial_state(snippet)) for snippet in snippets]
+    submission_id = uuid.uuid4().hex[:8]
+    snippets = await _split_with_fallback(
+        body.requirement, config=_trace_config(submission_id, "api", step="split")
+    )
+    final_states = [
+        await aria_graph.ainvoke(
+            initial_state(snippet),
+            config=_trace_config(
+                submission_id, "api", requirement_index=index, requirement_count=len(snippets)
+            ),
+        )
+        for index, snippet in enumerate(snippets)
+    ]
     return {"requirements": final_states}
 
 
@@ -59,8 +82,11 @@ async def run_requirement_ws(websocket: WebSocket) -> None:
     try:
         data = await websocket.receive_json()
         raw_requirement = data["requirement"]
+        submission_id = uuid.uuid4().hex[:8]
 
-        snippets = await _split_with_fallback(raw_requirement)
+        snippets = await _split_with_fallback(
+            raw_requirement, config=_trace_config(submission_id, "ws", step="split")
+        )
         await websocket.send_json({"node": "_split", "update": {"count": len(snippets)}})
 
         for index, snippet in enumerate(snippets):
@@ -71,7 +97,12 @@ async def run_requirement_ws(websocket: WebSocket) -> None:
                 }
             )
             try:
-                async for chunk in aria_graph.astream(initial_state(snippet), stream_mode="updates"):
+                run_config = _trace_config(
+                    submission_id, "ws", requirement_index=index, requirement_count=len(snippets)
+                )
+                async for chunk in aria_graph.astream(
+                    initial_state(snippet), config=run_config, stream_mode="updates"
+                ):
                     for node_name, update in chunk.items():
                         await websocket.send_json(
                             {

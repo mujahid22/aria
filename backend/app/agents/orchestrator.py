@@ -48,7 +48,7 @@ class SplitResult(BaseModel):
     )
 
 
-async def split_requirements(raw_text: str) -> list[str]:
+async def split_requirements(raw_text: str, *, config: dict | None = None) -> list[str]:
     """Detect and separate distinct requirements bundled in free text (e.g.
     meeting notes listing several asks at once). Runs once per submission,
     before the per-requirement pipeline. Any failure here just falls back to
@@ -61,10 +61,17 @@ async def split_requirements(raw_text: str) -> list[str]:
                 [
                     ("system", SPLIT_SYSTEM_PROMPT),
                     ("user", raw_text),
-                ]
+                ],
+                config=config,
             ),
-            attempts=2,
-            timeout=25.0,
+            # 3 attempts at 14s (worst case ~54s incl. rate-limit backoff)
+            # stays under the 60s split budget in main.py while giving real
+            # retry headroom under sustained quota pressure - eval runs
+            # surfaced this falling back to "treat as one requirement" under
+            # contention from concurrent production + eval traffic sharing
+            # the same Mistral quota, exhausting the old attempts=2 budget.
+            attempts=3,
+            timeout=14.0,
         )
     except Exception:
         return [raw_text]
@@ -83,8 +90,11 @@ async def orchestrator_node(state: AriaState) -> dict:
                     ("user", state["raw_requirement"]),
                 ]
             ),
-            attempts=2,
-            timeout=25.0,
+            # See split_requirements above for why attempts=3/timeout=14.0 -
+            # same rate-limit-exhaustion finding from the golden-dataset eval,
+            # still within the node's 60s deadline (graph.py) with margin.
+            attempts=3,
+            timeout=14.0,
         )
     except Exception as exc:
         return {
